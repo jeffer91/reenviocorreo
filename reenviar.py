@@ -76,28 +76,6 @@ def message_key(original):
     return None
 
 
-def index_history(db, store, session, excluded, stop, report):
-    pending = {row[0] for row in db.execute(
-        "SELECT id FROM progress EXCEPT SELECT original_id FROM identities"
-    )}
-    if not pending:
-        return
-    for folder in folders(store.GetRootFolder(), excluded):
-        if stop.is_set() or not pending:
-            return
-        report("status", "Comprobando historial en " + folder.FolderPath)
-        table = folder.GetTable()
-        while not table.EndOfTable and not stop.is_set() and pending:
-            entry_id = table.GetNextRow().Item("EntryID")
-            key = outlook_key(store.StoreID, entry_id)
-            if key in pending:
-                identity = message_key(session.GetItemFromID(entry_id, store.StoreID))
-                if identity:
-                    with db:
-                        db.execute("INSERT OR IGNORE INTO identities VALUES (?, ?)", (identity, key))
-                pending.remove(key)
-
-
 def forward(db, session, account, store_id, entry_id, target):
     key = outlook_key(store_id, entry_id)
     if db.execute("SELECT 1 FROM progress WHERE id=?", (key,)).fetchone():
@@ -130,47 +108,83 @@ def forward(db, session, account, store_id, entry_id, target):
     return True
 
 
-def monitor(db, session, account, target, stop, report):
+def inventory(db, session, account, stop, report):
     import pywintypes
 
     store = account.DeliveryStore
     store_id = store.StoreID
     excluded = {store.GetDefaultFolder(i).EntryID for i in (4, 5, 16)}
-    indexed = False
-    total = db.execute("SELECT count(*) FROM progress WHERE status='enviado'").fetchone()[0]
-    report("count", str(total))
-    while not stop.is_set():
-        if session.Offline:
-            report("status", "Outlook está sin conexión. Esperando…")
+    progress = dict(db.execute("SELECT id, status FROM progress"))
+    identities = dict(db.execute("SELECT message_id, original_id FROM identities"))
+    candidates = {}
+    states = {}
+    errors = 0
+    for folder in folders(store.GetRootFolder(), excluded):
+        if stop.is_set():
+            break
+        report("status", "Contando recibidos en " + folder.FolderPath)
+        table = folder.GetTable()
+        while not stop.is_set() and not table.EndOfTable:
+            row = table.GetNextRow()
+            if not str(row.Item("MessageClass")).lower().startswith("ipm.note"):
+                continue
+            entry = row.Item("EntryID")
+            key = outlook_key(store_id, entry)
+            try:
+                item = session.GetItemFromID(entry, store_id)
+                if not received(item, account):
+                    continue
+                identity = message_key(item)
+            except pywintypes.com_error:
+                errors += 1
+                continue
+            token = identity or key
+            candidates.setdefault(token, entry)
+            state = progress.get(key) or progress.get(identities.get(identity))
+            if state:
+                if state == "enviado" or token not in states:
+                    states[token] = state
+                if identity and key in progress and identity not in identities:
+                    with db:
+                        db.execute("INSERT INTO identities VALUES (?, ?)", (identity, key))
+                    identities[identity] = key
+    pending = [entry for token, entry in candidates.items() if token not in states]
+    sent = sum(value == "enviado" for value in states.values())
+    return pending, (len(candidates), sent, len(states) - sent, len(pending)), errors
+
+
+def monitor(db, session, account, target, stop, approved, report):
+    if session.Offline:
+        raise RuntimeError("Conecta Outlook y vuelve a calcular el total.")
+    pending, counts, errors = inventory(db, session, account, stop, report)
+    if stop.is_set():
+        return
+    total, sent, review, remaining = counts
+    report("stats", counts)
+    if errors:
+        report("warning", f"Fuera del conteo por errores de lectura: {errors}")
+    if not remaining:
+        return "Revisión terminada. No hay recibidos pendientes de reenvío."
+    report("ready", f"Revisión terminada. Hay {remaining} pendientes.")
+    approved.wait()
+    store_id = account.DeliveryStore.StoreID
+    skipped = 0
+    for entry in pending:
+        if stop.is_set():
+            return
+        if forward(db, session, account, store_id, entry, target):
+            sent += 1
+            remaining -= 1
+            report("stats", (total, sent, review, remaining))
+            stop.wait(3)
         else:
-            if not indexed:
-                index_history(db, store, session, excluded, stop, report)
-                indexed = True
-            errors = 0
-            for folder in folders(store.GetRootFolder(), excluded):
-                if stop.is_set():
-                    return
-                report("status", "Revisando " + folder.FolderPath)
-                table = folder.GetTable()
-                while not table.EndOfTable and not stop.is_set():
-                    row = table.GetNextRow()
-                    if not str(row.Item("MessageClass")).lower().startswith("ipm.note"):
-                        continue
-                    try:
-                        submitted = forward(db, session, account, store_id, row.Item("EntryID"), target)
-                    except pywintypes.com_error:
-                        errors += 1
-                        report("warning", f"Mensajes pendientes por error de lectura en esta revisión: {errors}")
-                        continue
-                    if submitted:
-                        total += 1
-                        report("count", str(total))
-                        stop.wait(3)
-            report("status", "Historial revisado. Próxima revisión en un minuto.")
-        stop.wait(60)
+            skipped += 1
+    if skipped:
+        return f"Lote terminado. {skipped} mensajes cambiaron desde el conteo y se omitieron."
+    return "Lote terminado. Avance guardado."
 
 
-def run(directory, source, target, stop, report):
+def run(directory, source, target, stop, approved, report):
     import msvcrt
     import win32com.client
 
@@ -194,7 +208,7 @@ def run(directory, source, target, stop, report):
             uncertain = db.execute("SELECT COUNT(*) FROM progress WHERE status='revisar'").fetchone()[0]
             if uncertain:
                 report("warning", f"Envíos anteriores pendientes de comprobar: {uncertain}")
-            monitor(db, session, account, target, stop, report)
+            return monitor(db, session, account, target, stop, approved, report)
 
 
 def main():
@@ -202,14 +216,13 @@ def main():
     directory.mkdir(exist_ok=True)
     with closing(database(directory)) as db:
         saved = dict(db.execute("SELECT name,value FROM config"))
-        previous = db.execute("SELECT count(*) FROM progress WHERE status='enviado'").fetchone()[0]
     root = tk.Tk()
     root.title("Reenvío de correo")
     panel = ttk.Frame(root, padding=24)
     panel.pack(fill="both", expand=True)
     panel.columnconfigure(0, weight=1)
     ttk.Label(panel, text="Correos recibidos", font=("Segoe UI", 18, "bold")).grid(sticky="w")
-    ttk.Label(panel, text="Historial y mensajes nuevos · Leídos y sin leer").grid(sticky="w", pady=(0, 16))
+    ttk.Label(panel, text="Correos leídos y sin leer · Conteo previo al envío").grid(sticky="w", pady=(0, 16))
     fields = []
     for key, label in [("origen", "Cuenta de Outlook"), ("destino", "Reenviar a")]:
         ttk.Label(panel, text=label).grid(sticky="w")
@@ -220,16 +233,16 @@ def main():
             entry.configure(state="readonly")
         fields.append(entry)
     status = tk.StringVar(value="Listo para iniciar")
-    count = tk.StringVar(value=str(previous))
+    stats = tk.StringVar(value="Calcula el total para ver los pendientes.")
     warning = tk.StringVar()
     ttk.Label(panel, textvariable=status, wraplength=410).grid(sticky="w", pady=(6, 4))
-    ttk.Label(panel, text="Total histórico de reenvíos entregados a Outlook").grid(sticky="w")
-    ttk.Label(panel, textvariable=count, font=("Segoe UI", 18)).grid(sticky="w")
+    ttk.Label(panel, textvariable=stats, font=("Segoe UI", 11)).grid(sticky="w", pady=6)
     ttk.Label(panel, textvariable=warning, wraplength=410).grid(sticky="w")
     actions = ttk.Frame(panel)
     actions.grid(sticky="w", pady=(10, 0))
     events = queue.Queue()
     stop = threading.Event()
+    approved = threading.Event()
     active = False
     closing_window = False
 
@@ -238,10 +251,10 @@ def main():
             import pythoncom
             pythoncom.CoInitialize()
             try:
-                run(directory, source, target, stop, lambda k, v: events.put((k, v)))
+                result = run(directory, source, target, stop, approved, lambda k, v: events.put((k, v)))
             finally:
                 pythoncom.CoUninitialize()
-            events.put(("done", "Detenido. Avance guardado."))
+            events.put(("done", result or "Detenido. Avance guardado."))
         except Exception as exc:
             events.put(("done", str(exc)))
 
@@ -252,6 +265,8 @@ def main():
             status.set("Introduce dos direcciones de correo válidas y distintas.")
             return
         stop.clear()
+        approved.clear()
+        stats.set("Calculando…")
         active = True
         for entry in fields:
             entry.configure(state="readonly")
@@ -263,6 +278,8 @@ def main():
 
     def halt():
         stop.set()
+        approved.set()
+        send_button.configure(state="disabled")
         status.set("Deteniendo después del mensaje en curso…")
         stop_button.configure(state="disabled")
 
@@ -280,6 +297,7 @@ def main():
             kind, value = events.get_nowait()
             if kind == "done":
                 active = False
+                send_button.configure(state="disabled")
                 if closing_window:
                     root.destroy()
                     return
@@ -290,12 +308,25 @@ def main():
                 start_button.configure(state="normal")
                 stop_button.configure(state="disabled")
                 status.set(value)
+            elif kind == "stats":
+                stats.set("Recibidos únicos: {}\nYa entregados a Outlook: {}\nEnvíos por verificar: {}\nPendientes de reenvío: {}".format(*value))
+            elif kind == "ready":
+                if not stop.is_set():
+                    status.set(value)
+                    send_button.configure(state="normal")
             elif kind != "status" or not stop.is_set():
-                {"status": status, "warning": warning, "count": count}[kind].set(value)
+                {"status": status, "warning": warning}[kind].set(value)
         root.after(200, refresh)
 
-    start_button = ttk.Button(actions, text="Reenviar solo mis correos recibidos", command=start)
+    def send():
+        send_button.configure(state="disabled")
+        status.set("Reenviando los recibidos pendientes…")
+        approved.set()
+
+    start_button = ttk.Button(actions, text="Calcular total", command=start)
     start_button.pack(side="left")
+    send_button = ttk.Button(actions, text="Reenviar pendientes", command=send, state="disabled")
+    send_button.pack(side="left", padx=5)
     stop_button = ttk.Button(actions, text="Detener", command=halt, state="disabled")
     stop_button.pack(side="left", padx=8)
     root.protocol("WM_DELETE_WINDOW", close)
@@ -305,3 +336,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
