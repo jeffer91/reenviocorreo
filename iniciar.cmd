@@ -20,5 +20,11 @@ if errorlevel 1 (
     "%venv%\Scripts\python.exe" -m pip install pywin32
     if errorlevel 1 exit /b 1
 )
-"%venv%\Scripts\python.exe" "%~dp0reenviar.py"
+"%venv%\Scripts\python.exe" -c "import tkinter" >nul 2>nul
+if errorlevel 1 (
+    echo Instala el componente Tcl/Tk de Python para abrir la interfaz.
+    pause
+    exit /b 1
+)
+start "" "%venv%\Scripts\pythonw.exe" "%~dp0reenviar.py"
 exit /b %errorlevel%
