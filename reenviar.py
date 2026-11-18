@@ -17,6 +17,7 @@ def database(directory):
     db = sqlite3.connect(directory / "estado.sqlite3")
     db.executescript("""
         CREATE TABLE IF NOT EXISTS config(name TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS identities(message_id TEXT PRIMARY KEY, original_id TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS progress(id TEXT PRIMARY KEY, status TEXT NOT NULL);
     """)
     return db
@@ -52,12 +53,60 @@ def folders(root, excluded):
         yield from folders(child, excluded)
 
 
+def outlook_key(store_id, entry_id):
+    return hashlib.sha256((store_id + "/" + entry_id).encode()).hexdigest()
+
+
+def message_key(original):
+    import pywintypes
+
+    try:
+        value = original.PropertyAccessor.GetProperty(
+            "http://schemas.microsoft.com/mapi/proptag/0x1035001F"
+        )
+    except pywintypes.com_error as exc:
+        # A missing Internet Message-ID leaves the existing Outlook identifier in use.
+        if exc.hresult != -2147221233 and not (
+            exc.excepinfo and exc.excepinfo[-1] == -2147221233
+        ):
+            raise
+        return None
+    if value and value.strip():
+        return hashlib.sha256(value.strip().encode()).hexdigest()
+    return None
+
+
+def index_history(db, store, session, excluded, stop, report):
+    pending = {row[0] for row in db.execute(
+        "SELECT id FROM progress EXCEPT SELECT original_id FROM identities"
+    )}
+    if not pending:
+        return
+    for folder in folders(store.GetRootFolder(), excluded):
+        if stop.is_set() or not pending:
+            return
+        report("status", "Comprobando historial en " + folder.FolderPath)
+        table = folder.GetTable()
+        while not table.EndOfTable and not stop.is_set() and pending:
+            entry_id = table.GetNextRow().Item("EntryID")
+            key = outlook_key(store.StoreID, entry_id)
+            if key in pending:
+                identity = message_key(session.GetItemFromID(entry_id, store.StoreID))
+                if identity:
+                    with db:
+                        db.execute("INSERT OR IGNORE INTO identities VALUES (?, ?)", (identity, key))
+                pending.remove(key)
+
+
 def forward(db, session, account, store_id, entry_id, target):
-    key = hashlib.sha256((store_id + "/" + entry_id).encode()).hexdigest()
+    key = outlook_key(store_id, entry_id)
     if db.execute("SELECT 1 FROM progress WHERE id=?", (key,)).fetchone():
         return False
     original = session.GetItemFromID(entry_id, store_id)
     if not received(original, account):
+        return False
+    identity = message_key(original)
+    if identity and db.execute("SELECT 1 FROM identities WHERE message_id=?", (identity,)).fetchone():
         return False
     copy = original.Forward()
     copy.SendUsingAccount = account
@@ -69,6 +118,8 @@ def forward(db, session, account, store_id, entry_id, target):
     copy.UserProperties.Add(MARKER, 1, False).Value = key
     # Persist before Send: a crash after submission must not trigger another send.
     with db:
+        if identity:
+            db.execute("INSERT INTO identities VALUES (?, ?)", (identity, key))
         db.execute("INSERT INTO progress VALUES (?, 'revisar')", (key,))
     try:
         copy.Send()
@@ -85,11 +136,16 @@ def monitor(db, session, account, target, stop, report):
     store = account.DeliveryStore
     store_id = store.StoreID
     excluded = {store.GetDefaultFolder(i).EntryID for i in (4, 5, 16)}
-    total = 0
+    indexed = False
+    total = db.execute("SELECT count(*) FROM progress WHERE status='enviado'").fetchone()[0]
+    report("count", str(total))
     while not stop.is_set():
         if session.Offline:
             report("status", "Outlook está sin conexión. Esperando…")
         else:
+            if not indexed:
+                index_history(db, store, session, excluded, stop, report)
+                indexed = True
             errors = 0
             for folder in folders(store.GetRootFolder(), excluded):
                 if stop.is_set():
@@ -146,6 +202,7 @@ def main():
     directory.mkdir(exist_ok=True)
     with closing(database(directory)) as db:
         saved = dict(db.execute("SELECT name,value FROM config"))
+        previous = db.execute("SELECT count(*) FROM progress WHERE status='enviado'").fetchone()[0]
     root = tk.Tk()
     root.title("Reenvío de correo")
     panel = ttk.Frame(root, padding=24)
@@ -163,10 +220,10 @@ def main():
             entry.configure(state="readonly")
         fields.append(entry)
     status = tk.StringVar(value="Listo para iniciar")
-    count = tk.StringVar(value="0")
+    count = tk.StringVar(value=str(previous))
     warning = tk.StringVar()
     ttk.Label(panel, textvariable=status, wraplength=410).grid(sticky="w", pady=(6, 4))
-    ttk.Label(panel, text="Reenvíos entregados a Outlook en esta sesión").grid(sticky="w")
+    ttk.Label(panel, text="Total histórico de reenvíos entregados a Outlook").grid(sticky="w")
     ttk.Label(panel, textvariable=count, font=("Segoe UI", 18)).grid(sticky="w")
     ttk.Label(panel, textvariable=warning, wraplength=410).grid(sticky="w")
     actions = ttk.Frame(panel)
@@ -202,7 +259,6 @@ def main():
         stop_button.configure(state="normal")
         status.set("Conectando con Outlook…")
         warning.set("")
-        count.set("0")
         threading.Thread(target=worker, args=(source, target)).start()
 
     def halt():
@@ -238,7 +294,7 @@ def main():
                 {"status": status, "warning": warning, "count": count}[kind].set(value)
         root.after(200, refresh)
 
-    start_button = ttk.Button(actions, text="Iniciar", command=start)
+    start_button = ttk.Button(actions, text="Reenviar solo mis correos recibidos", command=start)
     start_button.pack(side="left")
     stop_button = ttk.Button(actions, text="Detener", command=halt, state="disabled")
     stop_button.pack(side="left", padx=8)
