@@ -108,6 +108,49 @@ def forward(db, session, account, store_id, entry_id, target):
     return True
 
 
+def scan_folder(folder, stop, notify):
+    import pywintypes
+
+    table = folder.GetTable()
+    try:
+        size = table.GetRowCount()
+    except pywintypes.com_error:
+        size = "?"
+    count = 0
+    notify(count, size)
+    prefix = "http://schemas.microsoft.com/mapi/proptag/"
+    try:
+        columns = table.Columns
+        columns.RemoveAll()
+        for name in ("EntryID", "MessageClass", prefix + "0x0E070003",
+                     prefix + "0x5D01001F", prefix + "0x0C1F001F", prefix + "0x1035001F"):
+            columns.Add(name)
+        while not stop.is_set() and not table.EndOfTable:
+            values = table.GetArray(128)
+            if not values or not values[0]:
+                break
+            for row in zip(*values):
+                if stop.is_set():
+                    return
+                count += 1
+                if count % 32 == 0:
+                    notify(count, size)
+                yield row
+        notify(count, size)
+        return
+    except pywintypes.com_error:
+        # Some Outlook providers do not expose all table columns.
+        table = folder.GetTable()
+    count = 0
+    while not stop.is_set() and not table.EndOfTable:
+        row = table.GetNextRow()
+        count += 1
+        if count % 16 == 1:
+            notify(count, size)
+        yield row.Item("EntryID"), row.Item("MessageClass"), None, None, None, None
+    notify(count, size)
+
+
 def inventory(db, session, account, stop, report):
     import pywintypes
 
@@ -119,25 +162,37 @@ def inventory(db, session, account, stop, report):
     candidates = {}
     states = {}
     errors = 0
+    own_addresses = {account.SmtpAddress.casefold(), (account.CurrentUser.AddressEntry.Address or "").casefold()}
+    additions = []
     for folder in folders(store.GetRootFolder(), excluded):
         if stop.is_set():
             break
-        report("status", "Contando recibidos en " + folder.FolderPath)
-        table = folder.GetTable()
-        while not stop.is_set() and not table.EndOfTable:
-            row = table.GetNextRow()
-            if not str(row.Item("MessageClass")).lower().startswith("ipm.note"):
+        name = folder.Name
+        def notify(count, size):
+            report("status", f"{name} · {count} de {size} elementos revisados")
+        for entry, kind, flags, smtp, address, internet_id in scan_folder(folder, stop, notify):
+            if not str(kind).lower().startswith("ipm.note"):
                 continue
-            entry = row.Item("EntryID")
             key = outlook_key(store_id, entry)
-            try:
-                item = session.GetItemFromID(entry, store_id)
-                if not received(item, account):
-                    continue
-                identity = message_key(item)
-            except pywintypes.com_error:
-                errors += 1
+            sender = smtp if isinstance(smtp, str) and "@" in smtp else address
+            known_sender = isinstance(sender, str) and "@" in sender
+            if isinstance(flags, int) and flags >= 0 and flags & (0x08 | 0x20):
                 continue
+            if isinstance(sender, str) and sender.casefold() in own_addresses and sender:
+                continue
+            if (known_sender and isinstance(flags, int) and flags >= 0
+                    and str(kind).lower() == "ipm.note"
+                    and isinstance(internet_id, str) and internet_id.strip()):
+                identity = hashlib.sha256(internet_id.strip().encode()).hexdigest()
+            else:
+                try:
+                    item = session.GetItemFromID(entry, store_id)
+                    if not received(item, account):
+                        continue
+                    identity = message_key(item)
+                except pywintypes.com_error:
+                    errors += 1
+                    continue
             token = identity or key
             candidates.setdefault(token, entry)
             state = progress.get(key) or progress.get(identities.get(identity))
@@ -145,9 +200,10 @@ def inventory(db, session, account, stop, report):
                 if state == "enviado" or token not in states:
                     states[token] = state
                 if identity and key in progress and identity not in identities:
-                    with db:
-                        db.execute("INSERT INTO identities VALUES (?, ?)", (identity, key))
+                    additions.append((identity, key))
                     identities[identity] = key
+    with db:
+        db.executemany("INSERT OR IGNORE INTO identities VALUES (?, ?)", additions)
     pending = [entry for token, entry in candidates.items() if token not in states]
     sent = sum(value == "enviado" for value in states.values())
     return pending, (len(candidates), sent, len(states) - sent, len(pending)), errors
@@ -307,6 +363,8 @@ def main():
                     entry.configure(state="readonly" if key in configured else "normal")
                 start_button.configure(state="normal")
                 stop_button.configure(state="disabled")
+                if stats.get() == "Calculando…":
+                    stats.set("Conteo incompleto.")
                 status.set(value)
             elif kind == "stats":
                 stats.set("Recibidos únicos: {}\nYa entregados a Outlook: {}\nEnvíos por verificar: {}\nPendientes de reenvío: {}".format(*value))
@@ -336,4 +394,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
